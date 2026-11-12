@@ -1,0 +1,803 @@
+From 865838a35def8ded71d19f9432410b88daa42e1f Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Thu, 12 Nov 2026 16:59:04 +0000
+Subject: [PATCH] engine: HDR10 and SDR outputs for sinks without Dolby Vision
+
+Pass 2 can write the picture itself instead of the tunnel frame, as
+XRGB2101010 into the same output buffers. The colour is a 65^3 table,
+built on the CPU from the RPU and sampled with the GPU's trilinear
+filtering: the RPU's colour metadata decodes the composer's signal
+(Profile 5's IPT too) to BT.2020 linear light, written as PQ (HDR10,
+the sink maps) or, with each scene's L1 range mapped by BT.2390's EETF
+onto SDR's range, as BT.709 gamma 2.4. Per-pixel colour maths (table
+or ALU) made pass 2 two to three times as long.
+
+Pass 2 is bound by instruction count, so the display path takes the
+chroma of both columns from shared gathers of a 32-bit view of pass 1's
+chroma, applies Annex B's taps once to both, keeps it unrounded as the
+table's coordinate, and its interior variant skips the letterbox test.
+
+SDR's gain scales all three channels and the desaturation alike and its
+transfer is a power, so the decode is kept per entry for the stream and
+an L1 change only rebuilds the 1D gain and rescales the entries, in four
+slices on their own threads.
+
+On a Pi 5 SDR adds about 4.5 ms a 4K picture to the tunnel's (Profile
+5) and 2 ms (Profile 7 FEL); an L1 change takes about 1 ms.
+
+pi_stream_info gains the output kind: the API version is 4. dvbench:
+PI_OUTPUT sets the output kind.
+---
+ bench/dvbench.c             |   6 +-
+ engine/pi_engine.c          | 355 ++++++++++++++++++++++++++++++++++--
+ engine/pi_engine.h          |  15 +-
+ engine/shaders/p2_pack.frag | 124 +++++++++++--
+ 4 files changed, 462 insertions(+), 38 deletions(-)
+
+diff --git a/bench/dvbench.c b/bench/dvbench.c
+index 47cf875..0a7d47b 100644
+--- a/bench/dvbench.c
++++ b/bench/dvbench.c
+@@ -1419,7 +1419,8 @@ static int selftest(struct pi_options base, struct dv_picture *pics, int count,
+              "pi_probe: the engine's device", probed);
+     struct out_buf o[2];
+     memset(o, 0, sizeof(o));
+-    struct pi_stream_info si = {.width = W, .height = H, .profile = g_profile};
++    struct pi_stream_info si = {.width = W, .height = H, .profile = g_profile,
++                               .output = getenv("PI_OUTPUT") ? (enum pi_output_kind)atoi(getenv("PI_OUTPUT")) : PI_OUTPUT_TUNNEL};
+     struct pi_frame f = {.acquire_fd = -1};
+     int rc;
+ 
+@@ -1859,7 +1860,8 @@ int main(int argc, char **argv)
+         fprintf(stderr, "pi: display-management options: %s\n", pi_strerror(rc));
+         return 1;
+     }
+-    struct pi_stream_info si = {.width = W, .height = H, .profile = g_profile};
++    struct pi_stream_info si = {.width = W, .height = H, .profile = g_profile,
++                               .output = getenv("PI_OUTPUT") ? (enum pi_output_kind)atoi(getenv("PI_OUTPUT")) : PI_OUTPUT_TUNNEL};
+     if ((rc = pi_stream_open(g_pi, &si))) {
+         fprintf(stderr, "pi: stream %ux%u: %s\n", W, H, pi_strerror(rc));
+         return 1;
+diff --git a/engine/pi_engine.c b/engine/pi_engine.c
+index f5fd5c7..539b7c1 100644
+--- a/engine/pi_engine.c
++++ b/engine/pi_engine.c
+@@ -19,6 +19,7 @@
+ 
+ #include <errno.h>
+ #include <fcntl.h>
++#include <libavutil/dovi_meta.h>
+ #include <libavutil/hwcontext_drm.h>
+ #include <linux/sync_file.h>
+ #include <math.h>
+@@ -107,14 +108,20 @@ static const struct {
+     {14, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER},   /* BL chroma, RG32UI */
+     {15, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER},   /* PO: the overlay, R32UI */
+     {16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER}, /* PO's codes, bilinear */
++    {17, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER}, /* the display outputs' colour table */
++    {18, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER}, /* P1's chroma as R32UI (Cb | Cr << 16), for gathers */
+ };
++
++/* The display outputs' colour table (p2_pack.frag display()): LUT_N^3 RGBA16F,
++ * the composer's (Y, Cb, Cr) to the output's RGB codes / 1023. */
++enum { LUT_N = 65, LUT_BYTES = LUT_N * LUT_N * LUT_N * 8 };
+ enum { NB = sizeof(bindings) / sizeof(bindings[0]) };
+ 
+ /* Specialisation keys: P1's constant ids 0..15, and K1_PRE, which selects P0's
+  * shader (its METHOD, ELUP and QUAD are P1's ids); P2's 1..8. */
+ enum { K1_MODE, K1_METHOD, K1_DUAL, K1_KIND0, K1_KIND1, K1_ORDER0, K1_ORDER1, K1_SINGLE, K1_PIECE, K1_ORDER2,
+        K1_FAST, K1_MARK, K1_GUARD, K1_ELUP, K1_ELOUT, K1_QUAD, K1_PRE, K1_N };
+-enum { K2_ANNEXB, K2_TOP_LEFT, K2_ABLATE, K2_BARS, K2_SINGLE, K2_FULL422, K2_ELUP, K2_OVERLAY, K2_INTERIOR, K2_N };
++enum { K2_ANNEXB, K2_TOP_LEFT, K2_ABLATE, K2_BARS, K2_SINGLE, K2_FULL422, K2_ELUP, K2_OVERLAY, K2_INTERIOR, K2_OUTPUT, K2_N };
+ enum { MAX_SPEC = 17, KEY_MAX = K1_N };
+ /* EL upscales whose vertical filter P1 does (the vertical pairs): Annex B.
+  * Bicubic's 2 column pairs are cheaper filtered in P2, and Lanczos-3's
+@@ -184,6 +191,7 @@ struct pi_overlay {
+ /* A frame in flight. */
+ struct ctx {
+     struct image c420, ely;
++    VkImageView c420_32;      /* c420 as R32_UINT */
+     VkFramebuffer fb;
+     struct image elv;     /* P0's target: the EL chroma's vertical filter, ew x ch (Annex B, bicubic, Lanczos) */
+     VkFramebuffer fb0;
+@@ -200,6 +208,12 @@ struct ctx {
+     void *rmap;
+     uint64_t tables_serial;   /* e->tables_serial its tables hold, 0 none */
+     VkBufferView tview, tview64, tview128;
++    struct image lut;         /* the colour table: 3D, SHADER_READ_ONLY_OPTIMAL once lut_ready */
++    VkBuffer lut_buf;         /* its upload */
++    VkDeviceMemory lut_mem;
++    void *lut_map;
++    uint64_t lut_serial;      /* e->lut_serial lut_buf holds, 0 none */
++    int lut_ready, lut_upload;
+     VkDescriptorSet ds;
+     VkCommandBuffer cmd;
+     VkFence fence;
+@@ -341,6 +355,16 @@ struct pi_engine {
+     int open, first;
+     uint32_t w, h;
+     int profile_dv;
++    enum pi_output_kind output;
++
++    /* the display outputs' colour table (colour()): the RPU values it is for */
++    _Float16 *lut;
++    uint64_t lut_serial;
++    double colour_key[24];
++    /* SDR: per entry its desaturated colour's transfer before the tone map's
++     * gain, and its luminance's place in the gain table (colour()) */
++    float *pre;
++    int pre_valid;
+ 
+     /* the current tables (prepare): their serial, for the contexts' copies */
+     uint32_t *tables;
+@@ -486,9 +510,10 @@ static int view(struct pi_engine *e, struct image *im, VkFormat f)
+     return 0;
+ }
+ 
+-static int image(struct pi_engine *e, struct image *im, VkFormat f, uint32_t w, uint32_t h, VkImageUsageFlags usage)
++static int image_flags(struct pi_engine *e, struct image *im, VkFormat f, uint32_t w, uint32_t h,
++                       VkImageUsageFlags usage, VkImageCreateFlags flags)
+ {
+-    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f,
++    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = VK_IMAGE_TYPE_2D, .format = f,
+                             .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                             .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
+                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+@@ -502,6 +527,11 @@ static int image(struct pi_engine *e, struct image *im, VkFormat f, uint32_t w,
+     return view(e, im, f);
+ }
+ 
++static int image(struct pi_engine *e, struct image *im, VkFormat f, uint32_t w, uint32_t h, VkImageUsageFlags usage)
++{
++    return image_flags(e, im, f, w, h, usage, 0);
++}
++
+ static void image_destroy(struct pi_engine *e, struct image *im)
+ {
+     vkDestroyImageView(e->dev, im->view, NULL);
+@@ -1134,6 +1164,28 @@ static int create_ctx(struct pi_engine *e, struct ctx *c)
+         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds, .dstBinding = 15, .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .pTexelBufferView = &c->tview}};
+     vkUpdateDescriptorSets(e->dev, 6, wr, 0, NULL);
++    VkImageCreateInfo li = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_3D,
++                            .format = VK_FORMAT_R16G16B16A16_SFLOAT, .extent = {LUT_N, LUT_N, LUT_N}, .mipLevels = 1,
++                            .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
++                            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++                            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
++    VKC(e, vkCreateImage(e->dev, &li, NULL, &c->lut.img));
++    VkMemoryRequirements lr;
++    vkGetImageMemoryRequirements(e->dev, c->lut.img, &lr);
++    if ((rc = allocate(e, &lr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL, &c->lut.mem)))
++        return rc;
++    VKC(e, vkBindImageMemory(e->dev, c->lut.img, c->lut.mem, 0));
++    VkImageViewCreateInfo lvi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = c->lut.img,
++                                 .viewType = VK_IMAGE_VIEW_TYPE_3D, .format = VK_FORMAT_R16G16B16A16_SFLOAT,
++                                 .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
++    VKC(e, vkCreateImageView(e->dev, &lvi, NULL, &c->lut.view));
++    if ((rc = host_buffer(e, LUT_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &c->lut_buf, &c->lut_mem, &c->lut_map)))
++        return rc;
++    VkDescriptorImageInfo lii = {e->bilinear, c->lut.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
++    VkWriteDescriptorSet lw = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds, .dstBinding = 17,
++                               .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
++                               .pImageInfo = &lii};
++    vkUpdateDescriptorSets(e->dev, 1, &lw, 0, NULL);
+     VkCommandBufferAllocateInfo cai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                        .commandPool = e->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                        .commandBufferCount = 1};
+@@ -1380,8 +1432,10 @@ int pi_engine_create(const struct pi_options *o, struct pi_engine **out)
+     e->cache_path = o->pipeline_cache ? strdup(o->pipeline_cache) : NULL;
+     e->plan = calloc(1, sizeof(dvvk_plan));
+     e->tables = calloc(T_WORDS, 4);
++    e->lut = calloc(LUT_BYTES, 1);
++    e->pre = calloc((size_t)LUT_N * LUT_N * LUT_N * 4, sizeof(float));
+     e->state = dvvk_plan_state_new();
+-    int rc = !e->plan || !e->tables || !e->state || (o->pipeline_cache && !e->cache_path) ? PI_E_NOMEM : create(e);
++    int rc = !e->plan || !e->tables || !e->lut || !e->pre || !e->state || (o->pipeline_cache && !e->cache_path) ? PI_E_NOMEM : create(e);
+     e->o.device = NULL;   /* the caller's strings aren't kept */
+     e->o.pipeline_cache = NULL;
+     if (rc) {
+@@ -1511,6 +1565,8 @@ static void stream_images_destroy(struct pi_engine *e)
+         vkDestroyFramebuffer(e->dev, c->fb0, NULL);
+         vkDestroyFramebuffer(e->dev, c->fbp, NULL);
+         c->fb = c->fb0 = c->fbp = VK_NULL_HANDLE;
++        vkDestroyImageView(e->dev, c->c420_32, NULL);
++        c->c420_32 = VK_NULL_HANDLE;
+         image_destroy(e, &c->c420);
+         image_destroy(e, &c->ely);
+         image_destroy(e, &c->elv);
+@@ -1534,7 +1590,7 @@ void pi_stream_close(struct pi_engine *e)
+ int pi_stream_open(struct pi_engine *e, const struct pi_stream_info *info)
+ {
+     if (!info || info->width < 16 || info->height < 16 || (info->width | info->height) & 1 || info->width > 8192 ||
+-        info->height > 4320)
++        info->height > 4320 || info->output < PI_OUTPUT_TUNNEL || info->output > PI_OUTPUT_SDR)
+         return PI_E_INVALID;
+     pi_stream_close(e);
+     if (e->pending.set) {   /* pi_engine_configure's */
+@@ -1553,6 +1609,11 @@ int pi_stream_open(struct pi_engine *e, const struct pi_stream_info *info)
+     e->pm_found = 1;
+     e->overlay_before = 0;
+     e->profile_dv = info->profile;
++    e->output = info->output;
++    e->lut_serial = 0;
++    e->pre_valid = 0;
++    for (int k = 0; k < PI_FRAMES_IN_FLIGHT; k++)
++        e->c[k].lut_serial = 0;
+     if (info->width != e->w || info->height != e->h || !e->c[0].fb) {
+         stream_images_destroy(e);
+         e->w = info->width;
+@@ -1562,7 +1623,8 @@ int pi_stream_open(struct pi_engine *e, const struct pi_stream_info *info)
+         for (int k = 0; k < PI_FRAMES_IN_FLIGHT; k++) {
+             struct ctx *c = &e->c[k];
+             int rc;
+-            if ((rc = image(e, &c->c420, VK_FORMAT_R16G16_UINT, cw, ch, rt)) ||
++            if ((rc = image_flags(e, &c->c420, VK_FORMAT_R16G16_UINT, cw, ch, rt,
++                                  VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) ||
+                 (rc = image(e, &c->ely, VK_FORMAT_R16_UINT, cw, ch, rt)) ||
+                 (rc = image(e, &c->elv, VK_FORMAT_R16G16_UINT, cw / 2, ch, rt)) ||
+                 (rc = image(e, &c->elp, VK_FORMAT_R16G16_UINT, cw, ch, rt))) {
+@@ -1570,6 +1632,10 @@ int pi_stream_open(struct pi_engine *e, const struct pi_stream_info *info)
+                 e->w = e->h = 0;
+                 return rc;
+             }
++            VkImageViewCreateInfo vi32 = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = c->c420.img,
++                                          .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R32_UINT,
++                                          .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
++            VKC(e, vkCreateImageView(e->dev, &vi32, NULL, &c->c420_32));
+             VkImageView v[2] = {c->c420.view, c->ely.view};
+             VkFramebufferCreateInfo fbi = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = e->rp[0],
+                                            .attachmentCount = 2, .pAttachments = v, .width = cw, .height = ch,
+@@ -1584,18 +1650,19 @@ int pi_stream_open(struct pi_engine *e, const struct pi_stream_info *info)
+                                            .renderPass = e->rp1_pair, .attachmentCount = 2, .pAttachments = vp,
+                                            .width = cw, .height = ch, .layers = 1};
+             VKC(e, vkCreateFramebuffer(e->dev, &fbp, NULL, &c->fbp));
+-            VkDescriptorImageInfo ii[4] = {{e->sampler, c->c420.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
++            VkDescriptorImageInfo ii[5] = {{e->sampler, c->c420.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                            {e->sampler, c->ely.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                            {e->sampler, c->elv.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+-                                           {e->sampler, c->elp.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+-            const uint32_t to[4] = {7, 8, 12, 9};
+-            VkWriteDescriptorSet wr[4];
+-            for (int i = 0; i < 4; i++)
++                                           {e->sampler, c->elp.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
++                                           {e->sampler, c->c420_32, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
++            const uint32_t to[5] = {7, 8, 12, 9, 18};
++            VkWriteDescriptorSet wr[5];
++            for (int i = 0; i < 5; i++)
+                 wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds,
+                                                .dstBinding = to[i], .descriptorCount = 1,
+                                                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                                .pImageInfo = &ii[i]};
+-            vkUpdateDescriptorSets(e->dev, 4, wr, 0, NULL);
++            vkUpdateDescriptorSets(e->dev, 5, wr, 0, NULL);
+         }
+     }
+     e->open = 1;
+@@ -1861,6 +1928,9 @@ void pi_engine_destroy(struct pi_engine *e)
+             vkDestroyBufferView(e->dev, c->tview, NULL);
+             vkDestroyBufferView(e->dev, c->tview64, NULL);
+             vkDestroyBufferView(e->dev, c->tview128, NULL);
++            image_destroy(e, &c->lut);
++            vkDestroyBuffer(e->dev, c->lut_buf, NULL);
++            vkFreeMemory(e->dev, c->lut_mem, NULL);
+             vkDestroyBuffer(e->dev, c->tables, NULL);
+             vkDestroyBuffer(e->dev, c->ubo, NULL);
+             vkDestroyBuffer(e->dev, c->reshape, NULL);
+@@ -1898,6 +1968,8 @@ void pi_engine_destroy(struct pi_engine *e)
+         dvvk_plan_state_free(e->state);
+     free(e->plan);
+     free(e->tables);
++    free(e->lut);
++    free(e->pre);
+     free(e->cache_path);
+     pthread_cond_destroy(&e->wake);
+     pthread_mutex_destroy(&e->lock);
+@@ -2261,6 +2333,222 @@ static int bind_inputs(struct pi_engine *e, struct ctx *c, const AVFrame *bl, co
+ }
+ 
+ /* The frame's own Params over the generation's. */
++/* ---- the display outputs' colour ----------------------------------------------- */
++
++static double pq_linear(double v)   /* SMPTE ST 2084: 1 is 10000 nits */
++{
++    double p = pow(fmax(v, 0.0), 32.0 / 2523.0);
++    return pow(fmax(p - 3424.0 / 4096.0, 0.0) / (2413.0 / 128.0 - 2392.0 / 128.0 * p), 16384.0 / 2610.0);
++}
++
++static double pq_code(double y)
++{
++    double p = pow(fmax(y, 0.0), 2610.0 / 16384.0);
++    return pow((3424.0 / 4096.0 + 2413.0 / 128.0 * p) / (1.0 + 2392.0 / 128.0 * p), 2523.0 / 32.0);
++}
++
++static void mul3(const double a[9], const double b[9], double out[9])
++{
++    for (int i = 0; i < 3; i++)
++        for (int j = 0; j < 3; j++)
++            out[3 * i + j] = a[3 * i] * b[j] + a[3 * i + 1] * b[3 + j] + a[3 * i + 2] * b[6 + j];
++}
++
++/* BT.2390's EETF: luminance y (1: 10000 nits) of a scene from lb to lw nits,
++ * onto a display of 0 to peak nits; b, w and max_lum are eetf_range()'s. */
++static void eetf_range(double lb, double lw, double peak, double *b, double *w, double *max_lum)
++{
++    *b = pq_code(lb / 10000.0);
++    *w = pq_code(lw / 10000.0);
++    *max_lum = *w - *b < 1e-6 ? 0.0 : (pq_code(peak / 10000.0) - *b) / (*w - *b);
++}
++
++static double eetf(double y, double b, double w, double max_lum, double peak)
++{
++    if (w - b < 1e-6)
++        return fmin(y, peak / 10000.0);
++    double e1 = (pq_code(y) - b) / (w - b);
++    double ks = 1.5 * max_lum - 0.5, e2 = e1;
++    if (e1 > ks && ks < 1.0) {
++        double t = (e1 - ks) / (1.0 - ks), t2 = t * t, t3 = t2 * t;
++        e2 = (2 * t3 - 3 * t2 + 1) * ks + (t3 - 2 * t2 + t) * (1.0 - ks) + (-2 * t3 + 3 * t2) * max_lum;
++    }
++    return pq_linear(fmax(e2, 0.0) * (w - b) + b);
++}
++
++/* t, a table of n + 1 steps over [0, 1] of v^(1/4), at v */
++static double quartic(const float *t, int n, double v)
++{
++    double f = sqrt(sqrt(fmin(fmax(v, 0.0), 1.0))) * n;
++    int i = (int)f < n ? (int)f : n - 1;
++    return t[i] + (t[i + 1] - t[i]) * (f - i);
++}
++
++/* colour()'s table work in COLOUR_JOBS slices of its k planes: one on the
++ * calling thread, the others on threads of their own */
++enum { COLOUR_JOBS = 4 };
++
++struct colour_job {
++    _Float16 *lut;
++    float *pre;
++    int k0, k1, sdr;
++    const double *key, *out;
++    const float *dec, *enc, *g;
++};
++
++static void colour_parallel(void *(*fn)(void *), struct colour_job *jobs)
++{
++    pthread_t th[COLOUR_JOBS];
++    int started[COLOUR_JOBS] = {0};
++    for (int k = 1; k < COLOUR_JOBS; k++)
++        started[k] = !pthread_create(&th[k], NULL, fn, &jobs[k]);
++    fn(&jobs[0]);
++    for (int k = 1; k < COLOUR_JOBS; k++) {
++        if (started[k])
++            pthread_join(th[k], NULL);
++        else
++            fn(&jobs[k]);
++    }
++}
++
++/* the stream's part of the table (colour()): the colour decoded, desaturated
++ * and, for HDR10, encoded; for SDR its encoding before the gain, kept in pre */
++static void *colour_decode(void *arg)
++{
++    enum { STEPS = 1024 };
++    static const double luma[2][3] = {{0.2627, 0.6780, 0.0593}, {0.2126, 0.7152, 0.0722}};
++    const struct colour_job *jb = arg;
++    const double *key = jb->key, *out = jb->out;
++    const float *dec = jb->dec, *enc = jb->enc;
++    const int sdr = jb->sdr;
++    _Float16 *t = jb->lut + (size_t)4 * LUT_N * LUT_N * jb->k0;
++    float *pre = jb->pre + (size_t)4 * LUT_N * LUT_N * jb->k0;
++    for (int k = jb->k0; k < jb->k1; k++)
++        for (int j = 0; j < LUT_N; j++)
++            for (int i = 0; i < LUT_N; i++, t += 4, pre += 4) {
++                double sig[3] = {(double)i / (LUT_N - 1) - key[18], (double)j / (LUT_N - 1) - key[19],
++                                 (double)k / (LUT_N - 1) - key[20]};
++                double l[3], o[3];
++                for (int c = 0; c < 3; c++) {
++                    double n = fmin(fmax(key[3 * c] * sig[0] + key[3 * c + 1] * sig[1] + key[3 * c + 2] * sig[2], 0.0), 1.0);
++                    double f = n * STEPS;
++                    int fi = (int)f < STEPS ? (int)f : STEPS - 1;
++                    l[c] = dec[fi] + (dec[fi + 1] - dec[fi]) * (f - fi);
++                }
++                for (int c = 0; c < 3; c++)
++                    o[c] = out[3 * c] * l[0] + out[3 * c + 1] * l[1] + out[3 * c + 2] * l[2];
++                double y = fmax(luma[sdr][0] * o[0] + luma[sdr][1] * o[1] + luma[sdr][2] * o[2], 0.0);
++                double lo = fmin(o[0], fmin(o[1], o[2]));
++                for (int c = 0; c < 3; c++) {
++                    if (lo < 0.0)
++                        o[c] = y + (o[c] - y) * (y / fmax(y - lo, 1e-12));
++                    if (sdr)
++                        pre[c] = (float)quartic(enc, STEPS, o[c]);
++                    else
++                        t[c] = (_Float16)quartic(enc, STEPS, o[c]);
++                }
++                pre[3] = (float)(sqrt(sqrt(fmin(y, 1.0))) * STEPS);
++                t[3] = (_Float16)1.0f;
++            }
++    return NULL;
++}
++
++/* SDR's table (colour()): pre's colour scaled by the gain at its luminance */
++static void *colour_gain(void *arg)
++{
++    const struct colour_job *jb = arg;
++    _Float16 *t = jb->lut + (size_t)4 * LUT_N * LUT_N * jb->k0;
++    const float *pre = jb->pre + (size_t)4 * LUT_N * LUT_N * jb->k0, *g = jb->g;
++    for (int n = 0; n < LUT_N * LUT_N * (jb->k1 - jb->k0); n++, t += 4, pre += 4) {
++        int fi = (int)pre[3];
++        float f = pre[3] - (float)fi, gain = g[fi] + (g[fi + 1] - g[fi]) * f;
++        for (int c = 0; c < 3; c++)
++            t[c] = (_Float16)fminf(pre[c] * gain, 1.0f);
++        t[3] = (_Float16)1.0f;
++    }
++    return NULL;
++}
++
++/* The display outputs' colour table for the frame's RPU: its colour metadata
++ * decoded (planner/pixel_colour.c) to BT.2020 linear light, for SDR the
++ * scene's L1 range mapped onto SDR's (BT.2390's EETF on the luminance) and
++ * BT.709, negatives desaturated into the gamut, and the transfer (PQ, or
++ * gamma 2.4). Rebuilt when the RPU's colour metadata or (SDR) L1 changes.
++ * SDR's gain scales all three channels and the desaturation alike, and its
++ * transfer is a power, so (o g)^(1/2.4) = o^(1/2.4) g^(1/2.4): o^(1/2.4) is
++ * kept per entry (pre), and an L1 change only rescales it. */
++static void colour(struct pi_engine *e, const AVDOVIMetadata *md)
++{
++    /* Dolby Vision's LMS is BT.2020-referred (libplacebo's dovi_lms2rgb) */
++    static const double lms_to_2020[9] = {3.06441879, -2.16597676, 0.10155818, -0.65612108, 1.78554118,
++                                          -0.12943749, 0.01736321, -0.04725154, 1.03004253};
++    static const double bt2020_to_709[9] = {1.660491, -0.587641, -0.072850, -0.124550, 1.132900,
++                                            -0.008349, -0.018151, -0.100579, 1.118730};
++    enum { STEPS = 1024 };
++    const AVDOVIColorMetadata *cm = av_dovi_get_color(md);
++    const AVDOVIDmData *l1 = av_dovi_find_level(md, 1);
++    const int sdr = e->output == PI_OUTPUT_SDR;
++    /* SDR: BT.2408's HDR reference white is SDR's peak */
++    const double white = 203.0;
++    double key[24];
++    for (int i = 0; i < 9; i++) {
++        key[i] = av_q2d(cm->ycc_to_rgb_matrix[i]);
++        key[9 + i] = av_q2d(cm->rgb_to_lms_matrix[i]);
++    }
++    for (int i = 0; i < 3; i++)
++        key[18 + i] = av_q2d(cm->ycc_to_rgb_offset[i]);
++    /* the scene's range: L1, else the mastering display's */
++    key[21] = sdr ? pq_linear((l1 ? l1->l1.min_pq : cm->source_min_pq) / 4095.0) * 10000.0 : 0.0;
++    key[22] = sdr ? pq_linear((l1 && l1->l1.max_pq ? l1->l1.max_pq : cm->source_max_pq) / 4095.0) * 10000.0 : 0.0;
++    key[23] = (double)e->output;
++    if (e->lut_serial && !memcmp(key, e->colour_key, sizeof(key)))
++        return;
++
++    double t0 = now_ms();
++    int decoded = e->pre_valid && !memcmp(key, e->colour_key, 21 * sizeof(double)) && key[23] == e->colour_key[23];
++    if (!decoded) {
++        double lin[9], out[9];
++        mul3(lms_to_2020, key + 9, lin);
++        if (sdr)
++            mul3(bt2020_to_709, lin, out);
++        else
++            memcpy(out, lin, sizeof(out));
++        /* the transfers, the encodings as tables of v^(1/4) */
++        float dec[STEPS + 1], enc[STEPS + 1];
++        for (int i = 0; i <= STEPS; i++) {
++            double v = pow((double)i / STEPS, 4.0);
++            dec[i] = (float)pq_linear((double)i / STEPS);
++            enc[i] = (float)(sdr ? pow(v, 1.0 / 2.4) : pq_code(v));
++        }
++        struct colour_job jobs[COLOUR_JOBS];
++        for (int k = 0; k < COLOUR_JOBS; k++)
++            jobs[k] = (struct colour_job){e->lut, e->pre, LUT_N * k / COLOUR_JOBS, LUT_N * (k + 1) / COLOUR_JOBS,
++                                          sdr, key, out, dec, enc, NULL};
++        colour_parallel(colour_decode, jobs);
++        e->pre_valid = sdr;
++    }
++    if (sdr) {
++        /* the gain^(1/2.4) as a table of y^(1/4) */
++        float g[STEPS + 2];
++        double b, w, max_lum;
++        eetf_range(key[21], fmax(key[22], white), white, &b, &w, &max_lum);
++        for (int i = 0; i <= STEPS; i++) {
++            double x = fmax(pow((double)i / STEPS, 4.0), 1e-12);
++            g[i] = (float)pow(eetf(x, b, w, max_lum, white) / x * 10000.0 / white, 1.0 / 2.4);
++        }
++        g[STEPS + 1] = g[STEPS];
++        struct colour_job jobs[COLOUR_JOBS];
++        for (int k = 0; k < COLOUR_JOBS; k++)
++            jobs[k] = (struct colour_job){e->lut, e->pre, LUT_N * k / COLOUR_JOBS, LUT_N * (k + 1) / COLOUR_JOBS,
++                                          sdr, NULL, NULL, NULL, NULL, g};
++        colour_parallel(colour_gain, jobs);
++    }
++    memcpy(e->colour_key, key, sizeof(key));
++    e->lut_serial++;
++    logf_(e, PI_LOG_DEBUG, "colour table %u made in %.1f ms%s", (unsigned)e->lut_serial, now_ms() - t0,
++          decoded ? " (gain only)" : "");
++}
++
+ static void frame_params(struct pi_engine *e, const dvvk_plan *p, const AVFrame *el, uint32_t oy, struct params *q)
+ {
+     uint32_t w = e->w, h = e->h;
+@@ -2323,6 +2611,7 @@ static void keys(const struct pi_engine *e, const dvvk_plan *p, uint32_t k1[K1_N
+     k2[K2_SINGLE] = (uint32_t)(rt->single || rt->piece);
+     k2[K2_FULL422] = rt->piece == 2;
+     k2[K2_ELUP] = k1[K1_ELUP];
++    k2[K2_OUTPUT] = (uint32_t)e->output;
+ }
+ 
+ struct band {
+@@ -2672,6 +2961,34 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
+                              VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 1, &mb, 0,
+                              NULL, 0, NULL);
+     }
++    if (c->lut_upload || !c->lut_ready) {
++        /* the colour table: its upload, or once the layout its descriptor names */
++        VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++                                   .srcAccessMask = c->lut_ready ? VK_ACCESS_SHADER_READ_BIT : 0,
++                                   .dstAccessMask = c->lut_upload ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT,
++                                   .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++                                   .newLayout = c->lut_upload ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
++                                                              : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = c->lut.img,
++                                   .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
++        vkCmdPipelineBarrier(c->cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
++                             c->lut_upload ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
++                             0, NULL, 0, NULL, 1, &ib);
++        if (c->lut_upload) {
++            VkBufferImageCopy cp = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++                                    .imageExtent = {LUT_N, LUT_N, LUT_N}};
++            vkCmdCopyBufferToImage(c->cmd, c->lut_buf, c->lut.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
++            ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++            ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
++            ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++            ib.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++            vkCmdPipelineBarrier(c->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
++                                 NULL, 0, NULL, 1, &ib);
++        }
++        c->lut_ready = 1;
++        c->lut_upload = 0;
++    }
+     int overlay = ov->n > 0;
+     /* Pass 1 only over the letterbox's row window (yblod's, with the margin the
+      * filters need; 8-aligned): pass 2 reads no chroma or EL outside it, and
+@@ -2839,7 +3156,7 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
+     uint32_t a0 = p->active[1] / 2, a1 = (p->active[3] + 1) / 2;
+     if (all || a1 <= a0 || a0 < py || a1 > py + ch)
+         a0 = py, a1 = py + ch;
+-    uint32_t prow = (c->pmap->pk[3] + 1) / 2;   /* block rows the packets reach */
++    uint32_t prow = e->output == PI_OUTPUT_TUNNEL ? (c->pmap->pk[3] + 1) / 2 : 0;   /* block rows the packets reach */
+     uint32_t top = a0 < prow ? a0 : prow, bottom = prow > a1 ? (prow < och ? prow : och) : a1;
+     if (e->o.measure & PI_MEASURE_DRAW_BARS)
+         top = a0, bottom = och;
+@@ -2893,7 +3210,7 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
+     region(b, &nb, pb, overlay ? ov->bars : NULL, a1, och, bottom, r, ov->n, cw);
+     VkClearValue black;
+     for (int l = 0; l < 2; l++)
+-        black.color.uint32[l] = PI_PACK(p->black[0], l ? p->black[2] : p->black[1]);
++        black.color.uint32[l] = e->output != PI_OUTPUT_TUNNEL ? 0xc0000000u : PI_PACK(p->black[0], l ? p->black[2] : p->black[1]);
+     black.color.uint32[2] = black.color.uint32[3] = 0;
+     /* under the overlay's opaque cells, the overlay over black: nothing of the
+      * picture read */
+@@ -3138,7 +3455,7 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
+     imports_trim(e);
+     uint32_t orc[PI_OVERLAY_RECTS][4] = {{0}};
+     int norc = f->overlay ? overlay_rects(f, orc) : 0;
+-    struct pi_overlay *ov = norc ? f->overlay : NULL;
++    struct pi_overlay *ov = norc && e->output == PI_OUTPUT_TUNNEL ? f->overlay : NULL;
+ 
+     /* plan */
+     double t0 = now_ms();
+@@ -3187,6 +3504,14 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
+     if ((rc = bind_inputs(e, c, f->bl, f->el ? f->el : f->bl, q)))
+         goto release;
+     frame_params(e, p, f->el, oy, q);
++    if (e->output != PI_OUTPUT_TUNNEL) {
++        colour(e, (const AVDOVIMetadata *)dovi->data);
++        if (c->lut_serial != e->lut_serial) {
++            memcpy(c->lut_map, e->lut, LUT_BYTES);
++            c->lut_serial = e->lut_serial;
++            c->lut_upload = 1;
++        }
++    }
+     struct overlay_pass op = {0};
+     struct overlay_key okey;   /* this frame's overlay, recorded once submitted */
+     if (ov) {
+diff --git a/engine/pi_engine.h b/engine/pi_engine.h
+index 759c215..122e950 100644
+--- a/engine/pi_engine.h
++++ b/engine/pi_engine.h
+@@ -28,7 +28,7 @@ extern "C" {
+ /* This header's version: bumped by every change that breaks a caller built
+  * against the last (libpi_engine.so.PI_API_VERSION). pi_api_version() is
+  * the library's. */
+-#define PI_API_VERSION 3
++#define PI_API_VERSION 4
+ int pi_api_version(void);
+ 
+ #define PI_FRAMES_IN_FLIGHT 3
+@@ -174,9 +174,20 @@ struct pi_dm_status {
+ /* Of the last picture pi_render planned. */
+ void pi_engine_dm_status(const struct pi_engine *e, struct pi_dm_status *s);
+ 
++/* What pass 2 writes:
++ *   TUNNEL  the HDMI tunnel frame, for a sink that does Dolby Vision itself
++ *   HDR10   the picture itself for an HDR10 sink: BT.2020 RGB, PQ, as the
++ *           RPU's colour metadata decodes the composer's signal (Profile 5's
++ *           IPT too); no tone mapping, the sink maps
++ *   SDR     BT.709 RGB, gamma 2.4, 100 nits peak: each scene's L1 range
++ *           mapped to the SDR range (BT.2390's EETF on the luminance)
++ * HDR10 and SDR are linear XRGB2101010, full range. */
++enum pi_output_kind { PI_OUTPUT_TUNNEL = 0, PI_OUTPUT_HDR10 = 1, PI_OUTPUT_SDR = 2 };
++
+ struct pi_stream_info {
+     uint32_t width, height;       /* the decoded pictures' (even) */
+     int profile;                  /* the Dolby Vision profile (pi_chroma_top_left) */
++    enum pi_output_kind output;
+ };
+ /* Closes the open stream first. Resets the planner (packet continuity,
+  * cached tables) and builds the stream's pipelines. */
+@@ -185,7 +196,7 @@ int pi_stream_open(struct pi_engine *e, const struct pi_stream_info *info);
+ void pi_stream_close(struct pi_engine *e);
+ 
+ /* The output buffer a width x height stream renders into: linear XRGB8888
+- * (the tunnel frame's BGRA bytes), stride bytes a row, at least bytes long
++ * (the tunnel frame's BGRA bytes) or XRGB2101010 (pi_output_kind), stride bytes a row, at least bytes long
+  * (a row more than the picture, plus a page for drivers' padding). */
+ int pi_output_size(uint32_t width, uint32_t height, uint32_t *stride, uint64_t *bytes);
+ /* Imports the caller's dmabuf as an output of that size; fd stays the
+diff --git a/engine/shaders/p2_pack.frag b/engine/shaders/p2_pack.frag
+index 9e0279a..29e5b1a 100644
+--- a/engine/shaders/p2_pack.frag
++++ b/engine/shaders/p2_pack.frag
+@@ -53,6 +53,8 @@ layout(constant_id = 8) const uint OVERLAY = 0;
+ // the rows the metadata packets reach, so neither is tested.
+ layout(constant_id = 9) const uint INTERIOR = 0;
+ layout(binding = 16) uniform sampler2D overlay_codes;   // PO: (Y, Cb, Cr) x alpha / 4096, alpha
++// pi_output_kind: 0 the tunnel; 1 HDR10, 2 SDR: the picture as XRGB2101010
++layout(constant_id = 10) const uint OUTPUT = 0;
+ 
+ uint packet_byte(uint i) { return (P.packets[i >> 4][(i >> 2) & 3u] >> (8u * (i & 3u))) & 255u; }
+ 
+@@ -295,6 +297,97 @@ void block(uint x, uint y, uvec4 b, uvec4 e, uvec4 c, out uvec2 top, out uvec2 b
+     pack_block(x, y, yy, c, top, bottom);
+ }
+ 
++// The display outputs' picture (pi_engine.c colour()): the composer's signal
++// (Y, Cb, Cr codes) through a 65^3 table of the RPU's colour decode, the tone
++// map (SDR) and the transfer, as 10-bit RGB.
++layout(binding = 17) uniform sampler3D colour_lut;
++layout(binding = 18) uniform usampler2D chroma_packed;   // chroma420 as Cb | Cr << 16
++
++// at: the table coordinate of (Y, Cb, Cr)
++uint display(vec3 at)
++{
++    uvec3 q = uvec3(textureLod(colour_lut, at, 0.0).rgb * 1023.0 + 0.5);
++    return 0xc0000000u | (q.r << 20) | (q.g << 10) | q.b;
++}
++
++// The display outputs' 2 x 2 block at (x, y): yy its luma codes, e and d the
++// table's chroma coordinates of rows y and y + 1 at column x, e2 and d2 at
++// x + 2 (the odd column takes their mean).
++void display_block(uint x, uint y, uvec4 yy, vec2 e, vec2 d, vec2 e2, vec2 d2, out uvec2 top, out uvec2 bottom)
++{
++    const float ys = 64.0 / (65.0 * 4095.0), yo = 0.5 / 65.0;
++    vec4 l = vec4(yy) * ys + yo;
++    top = uvec2(display(vec3(l.x, e)), display(vec3(l.y, 0.5 * (e + e2))));
++    bottom = uvec2(display(vec3(l.z, d)), display(vec3(l.w, 0.5 * (d + d2))));
++    if (INTERIOR == 0u && (x < P.area.x || y < P.area.y || x + 1u >= P.area.z || y + 1u >= P.area.w)) {
++        bool ox0 = x < P.area.x || x >= P.area.z, ox1 = x + 1u < P.area.x || x + 1u >= P.area.z;
++        bool oy0 = y < P.area.y || y >= P.area.w, oy1 = y + 1u < P.area.y || y + 1u >= P.area.w;
++        top = mix(top, uvec2(0xc0000000u), bvec2(ox0 || oy0, ox1 || oy0));
++        bottom = mix(bottom, uvec2(0xc0000000u), bvec2(ox0 || oy1, ox1 || oy1));
++    }
++}
++
++// 4:2:2 chroma of rows 2k (e) and 2k+1 (d), (Cb, Cr) of column px. (No
++// local arrays: V3D's compiler puts arrays written in a loop in scratch.)
++void chroma_rows(uint px, uint k, out uvec2 e, out uvec2 d)
++{
++    int kk = int(k), last = int(P.size.w) - 1;
++    if (FULL422 != 0u) {
++        uvec2 a = texelFetch(chroma420, ivec2(px, k), 0).rg;
++        uint b = texelFetch(el_luma, ivec2(px, k), 0).r;
++        e = uvec2(a.x & 4095u, (a.x >> 12) | ((a.y & 255u) << 4));
++        d = uvec2((a.y >> 8) | ((b & 15u) << 8), b >> 4);
++    } else if (ANNEXB != 0u) {
++        vec2 r0 = crow(px, kk, 0, last), r1 = crow(px, kk, 1, last), r2 = crow(px, kk, 2, last),
++             r3 = crow(px, kk, 3, last), r4 = crow(px, kk, 4, last), r5 = crow(px, kk, 5, last),
++             r6 = crow(px, kk, 6, last);
++        vec2 r7 = TOP_LEFT != 0u ? crow(px, kk, 7, last) : vec2(0.0);
++        phases(r0, r1, r2, r3, r4, r5, r6, r7, e, d);
++    } else {
++        vec2 z = vec2(0.0);
++        phases(z, z, crow(px, kk, 2, last), crow(px, kk, 3, last), crow(px, kk, 4, last), z, z, z, e, d);
++    }
++}
++
++// The display outputs' chroma of rows 2k (e, d) at columns px and px + 1
++// (e2, d2), as table coordinates: Annex B's vertical filter unrounded, its
++// rows read as 2 x 2 gathers shared by both columns.
++void display_chroma(uint px, uint k, out vec2 e, out vec2 d, out vec2 e2, out vec2 d2)
++{
++    const float cs = 64.0 / (65.0 * 4095.0), co = 0.5 / 65.0;
++    if (ANNEXB == 0u || FULL422 != 0u || (ABLATE & 4u) != 0u) {
++        uvec2 ue, ud, ue2, ud2;
++        chroma_rows(px, k, ue, ud);
++        chroma_rows(min(px + 1u, P.size.z - 1u), k, ue2, ud2);
++        e = vec2(ue) * cs + co, d = vec2(ud) * cs + co, e2 = vec2(ue2) * cs + co, d2 = vec2(ud2) * cs + co;
++        return;
++    }
++    // rows k-3+2j, k-2+2j at columns px, px + 1: gather w (px, top), z (px + 1, top), x (px, bottom), y (px + 1, bottom)
++    vec2 at = vec2(float(px + 1u), float(int(k) - 2)) * P.inv.xy;
++    vec2 dy = vec2(0.0, 2.0 * P.inv.y);
++    uvec4 g0 = textureGather(chroma_packed, at, 0), g1 = textureGather(chroma_packed, at + dy, 0),
++          g2 = textureGather(chroma_packed, at + 2.0 * dy, 0), g3 = textureGather(chroma_packed, at + 3.0 * dy, 0);
++    // (Cb, Cr) of rows k-3 .. k+4, columns px (.xy) and px + 1 (.zw)
++    vec4 r0 = vec4(g0.w & 0xffffu, g0.w >> 16, g0.z & 0xffffu, g0.z >> 16);
++    vec4 r1 = vec4(g0.x & 0xffffu, g0.x >> 16, g0.y & 0xffffu, g0.y >> 16);
++    vec4 r2 = vec4(g1.w & 0xffffu, g1.w >> 16, g1.z & 0xffffu, g1.z >> 16);
++    vec4 r3 = vec4(g1.x & 0xffffu, g1.x >> 16, g1.y & 0xffffu, g1.y >> 16);
++    vec4 r4 = vec4(g2.w & 0xffffu, g2.w >> 16, g2.z & 0xffffu, g2.z >> 16);
++    vec4 r5 = vec4(g2.x & 0xffffu, g2.x >> 16, g2.y & 0xffffu, g2.y >> 16);
++    vec4 r6 = vec4(g3.w & 0xffffu, g3.w >> 16, g3.z & 0xffffu, g3.z >> 16);
++    // phases()'s Annex B taps, folded into the coordinate's scale
++    vec4 se, so;
++    if (TOP_LEFT != 0u) {
++        vec4 r7 = vec4(g3.x & 0xffffu, g3.x >> 16, g3.y & 0xffffu, g3.y >> 16);
++        se = r3 * cs + co;
++        so = (22.0 * (r0 + r7) + 94.0 * (r1 + r6) - 524.0 * (r2 + r5) + 2456.0 * (r3 + r4)) * (cs / 4096.0) + co;
++    } else {
++        se = (2.0 * r0 - 12.0 * r1 + 65.0 * r2 + 222.0 * r3 - 25.0 * r4 + 4.0 * r5) * (cs / 256.0) + co;
++        so = (4.0 * r1 - 25.0 * r2 + 222.0 * r3 + 65.0 * r4 - 12.0 * r5 + 2.0 * r6) * (cs / 256.0) + co;
++    }
++    e = se.xy, e2 = se.zw, d = so.xy, d2 = so.zw;
++}
++
+ void main()
+ {
+     // (px, k): the block in the output; x, y0 its first pixel. The picture
+@@ -318,25 +411,10 @@ void main()
+         return;
+     }
+ 
+-    // 4:2:2 chroma of rows 2k (e) and 2k+1 (d), (Cb, Cr) of column px. (No
+-    // local arrays: V3D's compiler puts arrays written in a loop in scratch.)
+-    int kk = int(k), last = int(P.size.w) - 1;
++    int kk = int(k);
+     uvec2 e, d;
+-    if (FULL422 != 0u) {
+-        uvec2 a = texelFetch(chroma420, ivec2(px, k), 0).rg;
+-        uint b = texelFetch(el_luma, ivec2(px, k), 0).r;
+-        e = uvec2(a.x & 4095u, (a.x >> 12) | ((a.y & 255u) << 4));
+-        d = uvec2((a.y >> 8) | ((b & 15u) << 8), b >> 4);
+-    } else if (ANNEXB != 0u) {
+-        vec2 r0 = crow(px, kk, 0, last), r1 = crow(px, kk, 1, last), r2 = crow(px, kk, 2, last),
+-             r3 = crow(px, kk, 3, last), r4 = crow(px, kk, 4, last), r5 = crow(px, kk, 5, last),
+-             r6 = crow(px, kk, 6, last);
+-        vec2 r7 = TOP_LEFT != 0u ? crow(px, kk, 7, last) : vec2(0.0);
+-        phases(r0, r1, r2, r3, r4, r5, r6, r7, e, d);
+-    } else {
+-        vec2 z = vec2(0.0);
+-        phases(z, z, crow(px, kk, 2, last), crow(px, kk, 3, last), crow(px, kk, 4, last), z, z, z, e, d);
+-    }
++    if (OUTPUT == 0u)
++        chroma_rows(px, k, e, d);
+ 
+     // EL luma rows k-1, k, k+1 at columns px, px + 1: two gathers
+     uvec4 el;
+@@ -352,5 +430,13 @@ void main()
+         vec2 at = vec2(float(px + 1u), float(k)) * P.inv.xy;   // rows k-1, k
+         el = el_block(textureGather(el_luma, at, 0), textureGather(el_luma, at + vec2(0.0, P.inv.y), 0));
+     }
+-    block(x, y0, bl_block(px, 2u * k), el, uvec4(e, d), o_even, o_odd);
++    uvec4 b = bl_block(px, 2u * k);
++    if (OUTPUT != 0u) {
++        vec2 fe, fd, fe2, fd2;
++        display_chroma(px, k, fe, fd, fe2, fd2);
++        display_block(x, y0, uvec4(luma(b.x, el.x), luma(b.y, el.y), luma(b.z, el.z), luma(b.w, el.w)), fe, fd, fe2,
++                      fd2, o_even, o_odd);
++        return;
++    }
++    block(x, y0, b, el, uvec4(e, d), o_even, o_odd);
+ }
+-- 
+2.43.0
+

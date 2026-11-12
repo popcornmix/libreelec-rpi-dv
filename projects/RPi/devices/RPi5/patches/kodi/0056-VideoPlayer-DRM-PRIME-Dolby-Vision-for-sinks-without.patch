@@ -1,0 +1,418 @@
+From 17d3751866a45ef80d5a9ec56eff75518419c9b9 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sun, 8 Nov 2026 22:11:02 +0000
+Subject: [PATCH] [VideoPlayer] DRM PRIME: Dolby Vision for sinks without it
+
+Without a Dolby Vision sink the engine renders the picture itself
+instead of the tunnel frame: HDR10 where Kodi passes HDR10 through,
+else SDR. The output is then an ordinary 10-bit RGB picture, signalled
+as HDR10 with the stream's (or the RPU's L6 or mastering) metadata, and
+scaled by the plane, so it needs no mode of the stream's size. The
+enhancement layer is decoded for any sink.
+---
+ .../DVDCodecs/Video/DVELDecoderDRMPRIME.cpp   |   5 +-
+ .../HwDecRender/DVTunnelDRMPRIME.cpp          | 105 ++++++++++++++++--
+ .../HwDecRender/DVTunnelDRMPRIME.h            |  20 +++-
+ .../HwDecRender/RendererDRMPRIME.cpp          |  65 ++++++++---
+ 4 files changed, 158 insertions(+), 37 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp
+index 9dc7a4b652..2767303b99 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp
+@@ -16,7 +16,6 @@
+ #include "settings/SettingsComponent.h"
+ #include "settings/lib/Setting.h"
+ #include "utils/log.h"
+-#include "windowing/WinSystem.h"
+ 
+ extern "C"
+ {
+@@ -64,9 +63,9 @@ std::unique_ptr<CDVELDecoderDRMPRIME> CDVELDecoderDRMPRIME::Create(const CDVDStr
+   const auto allowedHdrFormats = std::dynamic_pointer_cast<CSettingList>(
+       CServiceBroker::GetSettingsComponent()->GetSettings()->GetSetting(
+           CSettings::SETTING_VIDEOPLAYER_ALLOWEDHDRFORMATS));
++  // the renderer maps Dolby Vision for any sink (CDVTunnelDRMPRIME)
+   if (!CSettingUtils::FindIntInList(allowedHdrFormats,
+-                                    CSettings::VIDEOPLAYER_ALLOWED_HDR_TYPE_DOLBY_VISION) ||
+-      !CServiceBroker::GetWinSystem()->GetDisplayHDRCapabilities().SupportsDolbyVision())
++                                    CSettings::VIDEOPLAYER_ALLOWED_HDR_TYPE_DOLBY_VISION))
+     return nullptr;
+ 
+   std::unique_ptr<CDVELDecoderDRMPRIME> el(new CDVELDecoderDRMPRIME());
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+index cae6a00356..35e060524e 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+@@ -134,11 +134,17 @@ int AllocateDmaBuf(uint64_t size)
+ }
+ } // namespace
+ 
+-//! \brief A tunnel frame: an XRGB8888 linear dma-buf the engine renders into
++//! \brief A linear dma-buf the engine renders into: XRGB8888 (the tunnel), else XRGB2101010
+ class CDVTunnelOutput : public CVideoBufferDRMPRIME
+ {
+ public:
+-  CDVTunnelOutput(int id, int fd, uint32_t width, uint32_t height, uint32_t stride, uint64_t size)
++  CDVTunnelOutput(int id,
++                  int fd,
++                  uint32_t width,
++                  uint32_t height,
++                  uint32_t stride,
++                  uint64_t size,
++                  pi_output_kind output)
+     : CVideoBufferDRMPRIME(id), m_fd(fd), m_size(size), m_stride(stride)
+   {
+     m_descriptor.nb_objects = 1;
+@@ -146,7 +152,8 @@ public:
+     m_descriptor.objects[0].size = size;
+     m_descriptor.objects[0].format_modifier = DRM_FORMAT_MOD_LINEAR;
+     m_descriptor.nb_layers = 1;
+-    m_descriptor.layers[0].format = DRM_FORMAT_XRGB8888;
++    m_descriptor.layers[0].format =
++        output == PI_OUTPUT_TUNNEL ? DRM_FORMAT_XRGB8888 : DRM_FORMAT_XRGB2101010;
+     m_descriptor.layers[0].nb_planes = 1;
+     m_descriptor.layers[0].planes[0].object_index = 0;
+     m_descriptor.layers[0].planes[0].offset = 0;
+@@ -157,7 +164,7 @@ public:
+     picture.iWidth = picture.iDisplayWidth = width;
+     picture.iHeight = picture.iDisplayHeight = height;
+     picture.color_range = 1;
+-    picture.colorBits = 8;
++    picture.colorBits = output == PI_OUTPUT_TUNNEL ? 8 : 10;
+     SetPictureParams(picture);
+   }
+ 
+@@ -260,8 +267,78 @@ bool CDVTunnelDRMPRIME::Supports(const VideoPicture& picture)
+   return available;
+ }
+ 
++void CDVTunnelDRMPRIME::GetOutputPicture(const VideoPicture& picture,
++                                         pi_output_kind output,
++                                         VideoPicture& out)
++{
++  out.SetParams(picture);
++  out.color_range = 1;
++  if (output == PI_OUTPUT_SDR)
++  {
++    out.color_primaries = AVCOL_PRI_BT709;
++    out.color_transfer = AVCOL_TRC_BT709;
++    out.color_space = AVCOL_SPC_BT709;
++    out.hasDisplayMetadata = false;
++    out.hasLightMetadata = false;
++    return;
++  }
++
++  out.color_primaries = AVCOL_PRI_BT2020;
++  out.color_transfer = AVCOL_TRC_SMPTE2084;
++  out.color_space = AVCOL_SPC_BT2020_NCL;
++  if (out.hasDisplayMetadata && out.hasLightMetadata)
++    return;
++
++  auto* buffer = dynamic_cast<CVideoBufferDRMPRIMEFFmpeg*>(picture.videoBuffer);
++  const AVFrameSideData* side =
++      buffer ? av_frame_get_side_data(buffer->GetFrame(), AV_FRAME_DATA_DOVI_METADATA) : nullptr;
++  if (!side)
++    return;
++
++  const auto* metadata = reinterpret_cast<const AVDOVIMetadata*>(side->data);
++  const AVDOVIColorMetadata* colour = av_dovi_get_color(metadata);
++  const AVDOVIDmData* l6 = av_dovi_find_level(metadata, 6);
++  if (!out.hasDisplayMetadata)
++  {
++    // BT.2020 primaries and D65: Dolby Vision's LMS is BT.2020-referred
++    static constexpr int primaries[3][2] = {{35400, 14600}, {8500, 39850}, {6550, 2300}};
++    for (int i = 0; i < 3; i++)
++      for (int j = 0; j < 2; j++)
++        out.displayMetadata.display_primaries[i][j] = av_make_q(primaries[i][j], 50000);
++    out.displayMetadata.white_point[0] = av_make_q(15635, 50000);
++    out.displayMetadata.white_point[1] = av_make_q(16450, 50000);
++    if (l6 && l6->l6.max_luminance)
++    {
++      out.displayMetadata.max_luminance = av_make_q(l6->l6.max_luminance, 1);
++      out.displayMetadata.min_luminance = av_make_q(l6->l6.min_luminance, 10000);
++    }
++    else
++    {
++      const auto nits = [](int pq)
++      {
++        const double p = std::pow(pq / 4095.0, 32.0 / 2523.0);
++        return 10000.0 * std::pow(std::max(p - 3424.0 / 4096.0, 0.0) /
++                                      (2413.0 / 128.0 - 2392.0 / 128.0 * p),
++                                  16384.0 / 2610.0);
++      };
++      out.displayMetadata.max_luminance = av_d2q(nits(colour->source_max_pq), 100000);
++      out.displayMetadata.min_luminance = av_d2q(nits(colour->source_min_pq), 100000);
++    }
++    out.displayMetadata.has_primaries = 1;
++    out.displayMetadata.has_luminance = 1;
++    out.hasDisplayMetadata = true;
++  }
++  if (!out.hasLightMetadata && l6 && l6->l6.max_cll)
++  {
++    out.lightMetadata.MaxCLL = l6->l6.max_cll;
++    out.lightMetadata.MaxFALL = l6->l6.max_fall;
++    out.hasLightMetadata = true;
++  }
++}
++
+ std::unique_ptr<CDVTunnelDRMPRIME> CDVTunnelDRMPRIME::Create(const VideoPicture& picture,
+-                                                             const Options& options)
++                                                             const Options& options,
++                                                             pi_output_kind output)
+ {
+   std::unique_ptr<CDVTunnelDRMPRIME> tunnel(new CDVTunnelDRMPRIME());
+   tunnel->m_options = options;
+@@ -289,6 +366,7 @@ std::unique_ptr<CDVTunnelDRMPRIME> CDVTunnelDRMPRIME::Create(const VideoPicture&
+   tunnel->m_info.width = picture.iWidth;
+   tunnel->m_info.height = picture.iHeight;
+   tunnel->m_info.profile = picture.doviProfile;
++  tunnel->m_info.output = output;
+   ret = pi_stream_open(tunnel->m_engine, &tunnel->m_info);
+   if (ret != PI_OK)
+   {
+@@ -298,9 +376,12 @@ std::unique_ptr<CDVTunnelDRMPRIME> CDVTunnelDRMPRIME::Create(const VideoPicture&
+   }
+ 
+   // a stream cropped to the picture (3840x2076, say) goes out in a 16:9 frame: the tunnel
+-  // frame is never scaled, and the TV needs the mode's size
++  // frame is never scaled, and the TV needs the mode's size. The other outputs are scaled.
+   const unsigned int width = picture.iWidth;
+-  const unsigned int height = std::max<unsigned int>(picture.iHeight, (width * 9 / 16) & ~1u);
++  const unsigned int height =
++      output == PI_OUTPUT_TUNNEL
++          ? std::max<unsigned int>(picture.iHeight, (width * 9 / 16) & ~1u)
++          : static_cast<unsigned int>(picture.iHeight);
+   tunnel->m_outputWidth = width;
+   tunnel->m_outputHeight = height;
+ 
+@@ -321,21 +402,23 @@ std::unique_ptr<CDVTunnelDRMPRIME> CDVTunnelDRMPRIME::Create(const VideoPicture&
+       return nullptr;
+     }
+ 
+-    auto output = std::make_unique<CDVTunnelOutput>(i, fd, width, height, stride, bytes);
+-    ret = pi_output_import(tunnel->m_engine, fd, width, height, stride, bytes, &output->m_output);
++    auto buffer = std::make_unique<CDVTunnelOutput>(i, fd, width, height, stride, bytes, output);
++    ret = pi_output_import(tunnel->m_engine, fd, width, height, stride, bytes, &buffer->m_output);
+     if (ret != PI_OK)
+     {
+       CLog::Log(LOGERROR, "CDVTunnelDRMPRIME: output import: {}", pi_strerror(ret));
+       return nullptr;
+     }
+-    tunnel->m_pool->Add(std::move(output));
++    tunnel->m_pool->Add(std::move(buffer));
+   }
+ 
+-  CLog::Log(LOGINFO, "CDVTunnelDRMPRIME: profile {} at {}x{}{}: {}", picture.doviProfile,
++  static constexpr const char* outputs[] = {"tunnel", "HDR10", "SDR"};
++  CLog::Log(LOGINFO, "CDVTunnelDRMPRIME: profile {} at {}x{}{} to {}: {}", picture.doviProfile,
+             picture.iWidth, picture.iHeight,
+             height != static_cast<unsigned int>(picture.iHeight)
+                 ? StringUtils::Format(" in {}x{}", width, height)
+                 : "",
++            outputs[output],
+             pi_engine_describe(tunnel->m_engine));
+ 
+   return tunnel;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+index bd88a9669c..ea77a0fad0 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+@@ -9,6 +9,7 @@
+ #pragma once
+ 
+ #include "DRMPRIMEPlayerInfo.h"
++#include "cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h"
+ #include "utils/Geometry.h"
+ 
+ #include <functional>
+@@ -23,12 +24,11 @@ extern "C"
+ 
+ class CVideoBufferDRMPRIME;
+ class CDVTunnelOutputPool;
+-struct VideoPicture;
+ 
+ /*!
+- * \brief Standard (TV-led) Dolby Vision for the DRM PRIME video plane: renders
+- * each decoded picture, with its RPU and enhancement layer, into the 8-bit RGB
+- * tunnel frame the sink decodes, with libpi_engine on the GPU.
++ * \brief Dolby Vision for the DRM PRIME video plane: renders each decoded picture, with its RPU
++ * and enhancement layer, with libpi_engine on the GPU, into the 8-bit RGB tunnel frame a Dolby
++ * Vision sink decodes, or for other sinks into the picture itself as 10-bit RGB, HDR10 or SDR.
+  */
+ class CDVTunnelDRMPRIME
+ {
+@@ -63,7 +63,16 @@ public:
+   static bool Supports(const VideoPicture& picture);
+ 
+   static std::unique_ptr<CDVTunnelDRMPRIME> Create(const VideoPicture& picture,
+-                                                   const Options& options);
++                                                   const Options& options,
++                                                   pi_output_kind output);
++
++  /*!
++   * \brief The picture as an output other than the tunnel is signalled: its colour, and for
++   * HDR10 its mastering display and light levels from the RPU where the stream has none
++   */
++  static void GetOutputPicture(const VideoPicture& picture,
++                               pi_output_kind output,
++                               VideoPicture& out);
+ 
+   //! \brief Applies changed options, reopening the engine's stream for all but the metadata's
+   bool SetOptions(const Options& options);
+@@ -83,6 +92,7 @@ public:
+    */
+   unsigned int GetOutputWidth() const { return m_outputWidth; }
+   unsigned int GetOutputHeight() const { return m_outputHeight; }
++  pi_output_kind GetOutput() const { return m_info.output; }
+ 
+   /*!
+    * \brief Renders the picture into a free output.
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+index d96a00ecab..efaf31fd67 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+@@ -280,6 +280,19 @@ CDVTunnelDRMPRIME::Options GetDolbyVisionOptions(const CVideoSettings& settings)
+   return options;
+ }
+ 
++// the tunnel for a Dolby Vision sink, else the picture itself: HDR10 where Kodi passes HDR10
++// through, else SDR
++pi_output_kind GetDolbyVisionOutputKind(const CWinSystemGbm& winSystem)
++{
++  const CHDRCapabilities caps = winSystem.GetDisplayHDRCapabilities();
++  if (caps.SupportsDolbyVision())
++    return PI_OUTPUT_TUNNEL;
++  if (caps.SupportsHDR10() && CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
++                                  CWinSystemBase::SETTING_WINSYSTEM_IS_HDR_DISPLAY))
++    return PI_OUTPUT_HDR10;
++  return PI_OUTPUT_SDR;
++}
++
+ DolbyVisionOutput GetDolbyVisionInfoframe(const CVideoSettings& settings)
+ {
+   if (settings.m_DolbyVisionInfoframe == VS_DOLBYVISION_INFOFRAME_HDMI)
+@@ -297,37 +310,47 @@ bool CRendererDRMPRIME::SetDolbyVisionOutput(const VideoPicture& picture)
+ #if defined(HAVE_PIDV)
+   if (!m_dolbyVisionCapable)
+   {
+-    auto* winSystem = static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
+     const auto allowedHdrFormats = std::dynamic_pointer_cast<CSettingList>(
+         CServiceBroker::GetSettingsComponent()->GetSettings()->GetSetting(
+             CSettings::SETTING_VIDEOPLAYER_ALLOWEDHDRFORMATS));
+     m_dolbyVisionCapable =
+         CDVTunnelDRMPRIME::Supports(picture) &&
+         CSettingUtils::FindIntInList(allowedHdrFormats,
+-                                     CSettings::VIDEOPLAYER_ALLOWED_HDR_TYPE_DOLBY_VISION) &&
+-        winSystem->GetDisplayHDRCapabilities().SupportsDolbyVision();
++                                     CSettings::VIDEOPLAYER_ALLOWED_HDR_TYPE_DOLBY_VISION);
+   }
+ 
+   m_dolbyVisionEnabled = m_videoSettings.m_DolbyVision;
+   if (!m_dolbyVisionCapable || !m_dolbyVisionEnabled)
+     return false;
+ 
+-  m_dolbyVision = CDVTunnelDRMPRIME::Create(picture, GetDolbyVisionOptions(m_videoSettings));
++  auto* winSystem = static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
++  const pi_output_kind output = GetDolbyVisionOutputKind(*winSystem);
++  m_dolbyVision =
++      CDVTunnelDRMPRIME::Create(picture, GetDolbyVisionOptions(m_videoSettings), output);
+   if (!m_dolbyVision)
+     return false;
+ 
+-  auto* winSystem = static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
+-  if (!winSystem->SetDolbyVision(GetDolbyVisionInfoframe(m_videoSettings)))
++  if (output == PI_OUTPUT_TUNNEL &&
++      !winSystem->SetDolbyVision(GetDolbyVisionInfoframe(m_videoSettings)))
+   {
+     m_dolbyVision.reset();
+     return false;
+   }
+ 
+   m_dolbyVisionMismatches = 0;
+-  winSystem->SetGuiCompositing(false);
+-  SetGuiCapture(true);
+-  winSystem->SetHDR(nullptr);
+-  // the bridge configures the plane and connector for the tunnel's frames
++  if (output == PI_OUTPUT_TUNNEL)
++  {
++    winSystem->SetGuiCompositing(false);
++    SetGuiCapture(true);
++    winSystem->SetHDR(nullptr);
++  }
++  else
++  {
++    VideoPicture signalled;
++    CDVTunnelDRMPRIME::GetOutputPicture(picture, output, signalled);
++    SetHDROutput(signalled);
++  }
++  // the bridge configures the plane and connector for the engine's frames
+   m_iLastRenderBuffer = -1;
+   return true;
+ #else
+@@ -371,8 +394,9 @@ void CRendererDRMPRIME::UpdateDolbyVisionOutput(const VideoPicture& picture)
+     return;
+ 
+   m_dolbyVision->SetOptions(GetDolbyVisionOptions(m_videoSettings));
+-  static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem())
+-      ->SetDolbyVision(GetDolbyVisionInfoframe(m_videoSettings));
++  if (m_dolbyVision->GetOutput() == PI_OUTPUT_TUNNEL)
++    static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem())
++        ->SetDolbyVision(GetDolbyVisionInfoframe(m_videoSettings));
+ #endif
+ }
+ 
+@@ -385,8 +409,9 @@ bool CRendererDRMPRIME::RenderDolbyVision(CVideoBufferDRMPRIME* buffer)
+ 
+   // the tunnel frame is only decoded 1:1, in a mode of its size
+   const RESOLUTION_INFO& info = CServiceBroker::GetWinSystem()->GetGfxContext().GetResInfo();
+-  if (static_cast<unsigned int>(info.iScreenWidth) != m_dolbyVision->GetOutputWidth() ||
+-      static_cast<unsigned int>(info.iScreenHeight) != m_dolbyVision->GetOutputHeight())
++  if (m_dolbyVision->GetOutput() == PI_OUTPUT_TUNNEL &&
++      (static_cast<unsigned int>(info.iScreenWidth) != m_dolbyVision->GetOutputWidth() ||
++       static_cast<unsigned int>(info.iScreenHeight) != m_dolbyVision->GetOutputHeight()))
+   {
+     // a refresh rate switch may still be pending
+     if (++m_dolbyVisionMismatches < 100)
+@@ -409,7 +434,10 @@ bool CRendererDRMPRIME::RenderDolbyVision(CVideoBufferDRMPRIME* buffer)
+     m_videoLayerBridge->Configure(output);
+ 
+   const CRect frame(0, 0, m_dolbyVision->GetOutputWidth(), m_dolbyVision->GetOutputHeight());
+-  const CVideoLayerBridgeDRMPRIME::PlaneLayer layer{output, frame, frame};
++  const CVideoLayerBridgeDRMPRIME::PlaneLayer layer =
++      m_dolbyVision->GetOutput() == PI_OUTPUT_TUNNEL
++          ? CVideoLayerBridgeDRMPRIME::PlaneLayer{output, frame, frame}
++          : CVideoLayerBridgeDRMPRIME::PlaneLayer{output, m_planeSourceRect, m_planeDestRect};
+   m_videoLayerBridge->SetVideoPlane(std::span(&layer, 1), fence);
+   output->Release();
+   return true;
+@@ -764,14 +792,15 @@ void CRendererDRMPRIME::UpdatePlayerInfo(CVideoBufferDRMPRIME* buffer)
+   else
+     info["Info.Signal"] = "HDR10";
+ #if defined(HAVE_PIDV)
+-  if (m_dolbyVision)
++  if (m_dolbyVision && m_dolbyVision->GetOutput() == PI_OUTPUT_TUNNEL)
+   {
+     info["Info.Signal"] = "Dolby Vision";
+     info["Info.Infoframe"] =
+         GetDolbyVisionInfoframe(m_videoSettings) == DolbyVisionOutput::DOLBY_VSIF ? "Dolby VSIF"
+                                                                                   : "HDMI VSIF";
+-    m_dolbyVision->Describe(info, m_fps);
+   }
++  if (m_dolbyVision)
++    m_dolbyVision->Describe(info, m_fps);
+ #endif
+ 
+   dataCache.SetVideoPlayerInfo(std::move(info));
+@@ -856,7 +885,7 @@ bool CRendererDRMPRIME::RenderOverlays(OVERLAY::CRenderer& overlays, int index)
+     m_subtitleBounds = overlays.GetRenderedBounds();
+     return true;
+   }
+-  if (m_dolbyVision)
++  if (m_dolbyVision && m_dolbyVision->GetOutput() == PI_OUTPUT_TUNNEL)
+     return m_dolbyVision->DrawOverlay(
+         [&overlays, index]
+         {
+-- 
+2.43.0
+

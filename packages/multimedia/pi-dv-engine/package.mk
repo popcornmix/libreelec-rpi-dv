@@ -17,3 +17,8 @@ PKG_CMAKE_OPTS_TARGET="-DPI_BUILD_BENCH=OFF \
 post_makeinstall_target() {
   rm -rf ${INSTALL}/usr/share/doc
 }
+
+pre_configure_target() {
+  # the patched shader's SPIR-V, for builds without glslc (a patch can't carry it)
+  cp ${PKG_DIR}/spirv/p2_pack.frag.spv ${PKG_BUILD}/engine/shaders/spirv/
+}
